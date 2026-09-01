@@ -1,0 +1,83 @@
+/* =============================================================
+ * 暗色主题覆盖（.t-theme-dark）
+ * -------------------------------------------------------------
+ * tdesign-vue-next@1.20.7 未随包提供 dark css，这里手动提供中性语义
+ * 令牌的暗色取值（对齐 TDesign 官方暗色规范）。品牌色由个性化 store
+ * 通过 inline style 注入，不在此覆盖，故暗色下主色仍为用户所选。
+ *
+ * 引入顺序：main.ts 中须在 tokens.css 之后引入本文件，确保暗色中性
+ * 变量覆盖亮色默认值；品牌变量优先级：inline style > 本文件 > tokens.css。
+ * ============================================================= */
+
+.t-theme-dark {
+  /* 背景 */
+  --td-bg-color-page: #181818;
+  --td-bg-color-container: #242424;
+  --td-bg-color-container-hover: #323232;
+  --td-bg-color-container-active: #323232;
+  --td-bg-color-container-disabled: rgba(255, 255, 255, 0.1);
+  /* 边框 / 分隔线 */
+  --td-component-stroke: #3a3a3a;
+  --td-component-border: #424242;
+  /* 文本 */
+  --td-text-color-primary: rgba(255, 255, 255, 0.9);
+  --td-text-color-secondary: rgba(255, 255, 255, 0.6);
+  --td-text-color-placeholder: rgba(255, 255, 255, 0.4);
+  --td-text-color-disabled: rgba(255, 255, 255, 0.26);
+  --td-text-color-anti: rgba(0, 0, 0, 0.9);
+  /* 阴影（暗色下减弱） */
+  --td-shadow-1: 0 1px 10px rgba(0, 0, 0, 0.4);
+  --td-shadow-2: 0 1px 10px rgba(0, 0, 0, 0.4), 0 4px 5px rgba(0, 0, 0, 0.5);
+  --td-shadow-3: 0 3px 14px 2px rgba(0, 0, 0, 0.4), 0 8px 10px 1px rgba(0, 0, 0, 0.45);
+
+  /* Cube 扩展令牌：内容区在暗色下用页面底色，侧栏边框更弱 */
+  --cube-content-bg: #181818;
+  --cube-sidebar-border: rgba(255, 255, 255, 0.06);
+  --cube-topbar-border: var(--td-component-border);
+}
+
+/* 控制台 chrome：暗色下顶栏 / 内容区 / 侧边栏(菜单栏) / 登录左栏 跟随暗色主题
+ * !important 必要性：各组件 scoped 样式（如 .topbar{background:#fff} /
+ * .login-right{background:#fff} / .side{background:var(--cube-sidebar-bg)}）注入时机
+ * 晚于本文件、同级特异性下会后生效，故用 !important 保证暗色模式稳定胜出，
+ * 覆盖亮色品牌渐变与写死的白底，实现「顶栏/菜单栏/登录页」同步变暗。 */
+.t-theme-dark .topbar,
+.t-theme-dark .topbar-head {
+  background: var(--td-bg-color-container) !important;
+}
+.t-theme-dark .content {
+  background: var(--td-bg-color-page) !important;
+}
+/* 菜单栏（侧边栏）：暗色下中性暗底叠极淡品牌色，兼顾「暗色 + 品牌感」
+ * color-mix 把容器暗底与当前品牌主色按比例混合（默认 8% 品牌），
+ * 随个性化面板切换品牌色实时变化，纯中性灰改为有品牌辨识度的暗调。
+ * 首行作不支持 color-mix 浏览器的中性兜底。 */
+.t-theme-dark .side {
+  background: var(--td-bg-color-container) !important;
+  background: color-mix(in srgb, var(--td-bg-color-container) 92%, var(--td-brand-color) 8%) !important;
+}
+/* 登录左栏：由品牌渐变切换为中性暗底（与内容区形成层次） */
+.t-theme-dark .login-left {
+  background: var(--td-bg-color-container) !important;
+}
+/* 登录右栏（亮色时白底）：暗色改为容器暗底 */
+.t-theme-dark .login-right {
+  background: var(--td-bg-color-container) !important;
+}
+
+/* =============================================================
+ * 元素尺寸：紧凑（.cube-compact）
+ * -------------------------------------------------------------
+ * 通过下调 TDesign 组件内边距令牌，让输入框/按钮/表格等整体更紧凑。
+ * 仅影响组件默认尺寸（size 为 default 时），不破坏显式 size 设定。
+ * ============================================================= */
+.cube-compact {
+  --td-comp-paddingTB-s: 3px;
+  --td-comp-paddingLR-s: 8px;
+  --td-comp-paddingTB-m: 5px;
+  --td-comp-paddingLR-m: 12px;
+}
+/* 紧凑模式下内容区内边距同步收敛 */
+.cube-compact .content {
+  padding: 14px;
+}
