@@ -31,3 +31,20 @@ references/scaffold/
   迁移到你的工程，技能 `assets/*` 与 `tokens.*` 直接复用，不重复造轮子。
 
 > 资产文件对 `src/api/*` 的引用使用 `../../api/...`（基类组件落在 `src/components/cube/`），复制时注意目录层次。
+
+## 标准新工程初始化（tdesign-starter-cli，2026-09 起默认）
+
+真实 NewLife.Cube 后端项目一律先用官方 CLI 搭骨架，再拷入 `assets/` 模板：
+
+```bash
+npm i tdesign-starter-cli@latest -g
+td-starter init <项目名> -type vue3 -bt vite -temp lite   # 必须显式 -type vue3（默认 vue2）
+cd <项目名> && npm install && npm run dev
+```
+
+随后按 SKILL.md §11.2 的「assets/ → 目标路径映射表」拷入模板，并接入魔方内置 9 系统模块
+（/Admin/User、/Admin/Role、/Admin/Menu、/Admin/Department、/Admin/Parameter、/Admin/Log、
+/Admin/OAuthConfig、/Admin/Tenant、/Cube/App，路由 `/entity/:area/:controller` 零新增页面代码）
++ `DashboardView.vue` 仪表盘首页。注意：真实后端实体 API 在根路径 `/{Area}/{Controller}`（无 /api 前缀），
+vite 须代理 `/Admin`、`/cube` 与业务 Area——这与本目录 mock 场景（/api 前缀、勿代理 /Admin）不同。
+完整流程与验收清单见 SKILL.md §11。

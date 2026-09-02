@@ -180,21 +180,31 @@ import ListPage from '@/components/cube/ListPage.vue';
   经 `resolveOptions(field, lookups)` 生成 `<t-select :options>`。
 - **提交/回填键名（关键契约）**：**映射字段（`mapField` 非空）的表单键必须用原始字段名**（`RoleName(mapField=RoleID)` → `roleID`、`DepartmentName(mapField=DepartmentID)` → `departmentID`、`ParentName` → `parentID`、`AreaName` → `areaId`）——后端 POST/详情**只认真实列**，映射字段是虚拟属性，按自身名提交（`roleName: 2`）会被后端**静默忽略 → 保存后外键为空**（实测 User 新增后角色/部门列空白）。`fieldRender.formItemName(f)` 是统一键名函数（`mapField` 非空用 `camel(mapField)`，否则 `camel(f.name)`），`buildFormItems` 的 `item.name` 与 `FormDialog.rules` 校验键**必须共用它**（防键漂移导致校验失效）；编辑回填 `Object.assign(formData, row)` 依赖同一键与 `normalizeRows` 后的 camelCase 行数据匹配（顺带修正 `ParentName` 树形下拉回填——此前用显示名当 value 匹配不上）。
 
-**映射源解析顺序**（列表显名、表单下拉共用同一套）：
-1. `field.map`（`Record<value,label>`，`[Map]` 特性序列化而来）—— 既是显示名表也是选项；
-2. `field.dataSource`（`{text,value}[]` 选项源）；
+**映射源解析顺序**（列表显名、表单下拉共用同一套，⚠️ 以 `mapField` 双语义为准，见下）：
+1. **`mapField` 字典源（`[Map("k=v,...")]` 序列化而来）** —— 凡 `mapField` 在字段集里**命中不到同名字段**，
+   即判定为 `[Map]` 字典源（如 `PersonType.mapField="1=学生,2=教职工,3=校外人员"`、`ValueMode.mapField="1=原始值,2=外键解析名称,3=枚举转文本"`），
+   既是显示名表也是 `<t-select>` 选项；**这是 6.13 实测下枚举/字典字段的权威源**；
+2. `field.dataSource`（`{text,value}[]` 选项源，少数变体）；
 3. `lookups[lookupBaseName(field)]` —— 前端异步拉取关联实体 `Index` 组装的 `id→名` 字典
    （键为去 `ID/Id` 后缀的基名，如 `CategoryID → Category`）。三者皆空则该列按页面策略隐藏。
 
+> **⚠️ 关键修正（Cube 6.13 实测，2026-09）**：旧文档称 `[Map]` 字典源经 `field.map` 序列化，
+> **但 6.13 的 `DataField` 根本没有 `map` 字段**——`[Map]` 的源串被原样塞进了 `mapField`。
+> 代码若去读 `field.map`（不存在）就会拿不到字典，枚举字段被渲染成**原始 Int32**（如 `PersonType` 显示 `1`/`2`/`3`），
+> 这正是 Cube 通用列表页的历史坑。正确做法：解析 `mapField` 的字典串（见 §4.8.1）。
+> `fieldRender.ts` 里 `mapField` 双语义的 `mapFieldKind`/`parseMapSource`/`mapDictOf` 即为此而写；
+> `f.map` 仅作为**兼容兜底**（当前后端恒为 null，属死代码）。
+
 ```typescript
 // fieldRender.ts —— 列表回显（显示名称）与表单下拉（映射源）共用同一解析
-export function labelOf(f, value, lookups?) { /* map → dataSource → lookups */ }
-export function resolveOptions(f, lookups?) { /* map → dataSource → lookups（兜底空） */ }
+// 顺序：mapField 字典源 → dataSource → lookups（外键 id→名）
+export function labelOf(f, value, lookups?, fields?) { /* mapDictOf(f) → dataSource → lookups */ }
+export function resolveOptions(f, lookups?, fields?) { /* mapDictOf(f) → dataSource → lookups（兜底空） */ }
 ```
 
-> 外键兜底：当后端仅返回原始 `xxxID` 而未带 `map`/`dataSource`，页面进入时对每个待解析 `xxxID`
+> 外键兜底：当后端仅返回原始 `xxxID` 且 `mapField` 是真实字段名（映射字段，见 §4.8.1）时，
 > 用 `lookupBaseName` 得到关联实体名，调其 `Index` 拉全量记录组装 `{ [id]: name }` 写入 `lookups`，
-> 列表/表单自动复用。魔方多数场景已通过 `[Map]` 自动填充 `map`，lookup 仅为高级兜底。
+> 列表/表单自动复用。魔方多数枚举场景已通过 `[Map]` 写入 `mapField` 字典，lookup 仅为外键高级兜底。
 
 **`lookups` 自动加载（`useLookups.ts`）**：`ListPage` 在 `init()` 拉完 `GetPage` 后会自动调用
 `useLookups(area, overrides).load(list Fields)`，约定式地把每个 `xxxID` 外键解析为同 `area` 下同名控制器的
@@ -209,6 +219,48 @@ export function resolveOptions(f, lookups?) { /* map → dataSource → lookups�
 > （真实控制器是 `User`，没有 `CreateUser`/`UpdateUser`）。审计字段非业务外键：列表列显示后端已映射的名称字符串、
 > 表单只读，无需 id→name 字典。`useLookups.load` 在筛选开头排除 `createUserID`/`updateUserID`（及复数变体、
 > 含 `mapField` 引用它们的映射字段如 `UpdateUserName`）。
+
+### 4.8.1 `mapField` 双语义判别法（6.13 实测核心契约）
+
+`GetPage` 把 `FieldItem.Map` 的「源串」原样序列化进 **`mapField`** 这一个键，于是同一个 `mapField` 承载两种语义，**判别只看它的值**：
+
+| `mapField` 值形态 | 语义 | 判定 | 例子 |
+|---|---|---|---|
+| 能在**字段集**里命中同名字段 | **虚拟映射字段**（显示名→真实列） | `field` | `ClassName.mapField="ClassID"`、`ParentName.mapField="ParentID"` |
+| 含 `=`,`，非标识符 | **`[Map]` 枚举字典源** | `dict` | `PersonType.mapField="1=学生,2=教职工,3=校外人员"` |
+| 无字段集可对照时：纯标识符且不含 `=` | 退化为 `field`；否则 `dict` | 形状判别 | —— |
+
+判别函数（已落地于 `fieldRender.ts`）：
+
+```typescript
+export function mapFieldKind(f: DataField, fields?: DataField[]): 'none' | 'field' | 'dict' {
+  const mf = (f.mapField ?? '').trim()
+  if (!mf) return 'none'
+  // 关键：必须在字段集里找同名字段，命中才是映射字段，否则是字典源
+  if (fields && fields.length)
+    return fields.some((x) => x.name && x.name.toLowerCase() === mf.toLowerCase()) ? 'field' : 'dict'
+  return /^[A-Za-z_][A-Za-z0-9_]*$/.test(mf) ? 'field' : 'dict'
+}
+export function mapDictOf(f: DataField, fields?: DataField[]): Record<string, string> | null {
+  if (f.map && Object.keys(f.map).length) return f.map          // 兼容兜底（6.13 恒 null）
+  if (mapFieldKind(f, fields) !== 'dict') return null
+  return parseMapSource((f.mapField ?? '').trim())              // "1=男,2=女" → { '1':'男','2':'女' }
+}
+/** 控件选型：映射字段/枚举字典源 → select；{Boolean}→switch；Int→number；… */
+export function controlOf(f: DataField, fields?: DataField[]): string {
+  if (isMappedField(f, fields)) { /* multi → multi-select；ParentID → tree-select；否则 select */ }
+  if (mapDictOf(f, fields)) return 'select'
+  // … typeName/itemType 细分
+}
+```
+
+**对表单键名的硬约束（易错）**：
+- `mapField` 是**字典源**（`dict`）→ 该字段本身是真实列，提交键用 `f.name`（如 `personType`），options 来自 `parseMapSource(mapField)`；
+- `mapField` 是**真实字段名**（`field`）→ 该字段是虚拟显示列，**提交键必须用 `mapField`**（如 `ClassName→classID`），否则按自身名提交被后端静默忽略、外键存不进。
+
+> **实测验收坑（高频）**：TDesign `<t-select>` 渲染为自定义 `<div class="t-select">`，**不是原生 `<select>`**，
+> 故 `document.querySelectorAll('select')` 永远为 0——验收下拉是否存在要用 `.t-select` 类，或判定 `:placeholder` 是否等于 `请选择{label}`。
+> 浏览器内 `fetch('/{area}/{ctrl}/GetPage')` 转储 `addForm` 可确认 `mapField` 在响应中确实存在（camelize 对 `mapField` 幂等，不剥离）。
 
 ### 4.9 多租户
 
@@ -471,7 +523,7 @@ const special = computed(() => SPECIAL_CONTROLLERS[`${area.value}/${controller.v
   - **大小写归一**：后端 PascalCase（`Value/Label/Options/ListConfig`）统一归一到 camelCase（`value/label/...`），与前端 camelCase 键约定一致。
 - **`src/api/useLookups.ts`（扩展，接入通道1）**：`load(fields)` 现额外收集**未配 `lovCode` 且无 `map`/`dataSource`/非映射字段的枚举型字段**（`isEnumType(f)` 为真），批量 `GET /Cube/Lookup?codes=<枚举类型名>`；`CubeController` 为非 Area 控制器、属性路由根路径 `/Cube/Lookup`（无 `/api` 前缀），故先探 `/api/Cube/Lookup`（带 api 前缀部署）404 再回退 `/Cube/Lookup`（根路径），两者均不可达→静默退化。`/Cube/Lookup` 响应 `data` 为 `{ <类型名>: [{Label,Value}] }`，归一成 `lookups[typeName] = { 值: 名称 }`。
 - **`src/api/fieldRender.ts`（扩展，向后兼容，可选参）**：
-  - `resolveOptions(f, lookups?, lovOptions?)`：选项解析顺序 `field.map` → `field.dataSource` → **`lovOptions[lovCode]`（LovController 枚举值集，优先于约定式 lookups）** → `lookups[基名]`；
+  - `resolveOptions(f, lookups?, lovOptions?)`：选项解析顺序 `mapField` 字典源（`mapDictOf`）→ `field.dataSource` → **`lovOptions[lovCode]`（LovController 枚举值集，优先于约定式 lookups）** → `lookups[基名]`；（注：6.13 `DataField` 无 `field.map`，`[Map]` 字典源在 `mapField`，见 §4.8.1）
   - `labelOf(f, value, lookups?, lovOptions?)`：回显顺序同上，含多值（逗号分隔）逐项映射拼接；
   - `buildColumns(..., getLovOptions?)`：第 4 参 getter，单元格 `labelOf` 在第 3 优先级回显枚举名称；
   - `buildFormItems(fields, lookups?, lovOptions?)`：第 3 参，下拉 `options` 注入 `lovOptions`。
@@ -496,8 +548,9 @@ const special = computed(() => SPECIAL_CONTROLLERS[`${area.value}/${controller.v
 | DataField 特征 | 列表回显 | 表单控件 | 备注 |
 |----------------|----------|----------|------|
 | 字段名 `ParentID` | 树形表节点 | `t-tree-select` | 自引用树：选项来自同实体 `Index`，排除自身 |
-| 有 `map`/`dataSource` | 映射名称 | `t-select` | 枚举/字典/外键 |
-| 以 `ID`/`Id` 结尾且非主键（`xxxID`） | 映射名称 | `t-select` | 字段映射双模式，见 §4.8；无 map 时走 lookups 兜底 |
+| `mapField` 字典源（`[Map]` 枚举/字典串，如 `1=学生,2=教职工`） | 映射名称 | `t-select` | **6.13 权威源在 `mapField`，不在 `field.map`**（§4.8.1）；无字段集命中同名字段即字典源 |
+| `mapField`=真实字段名（虚拟映射列，如 `ClassName→ClassID`） | 映射名称 | `t-select`/`t-tree-select` | 提交键用 `mapField`（§4.8.1 硬约束） |
+| 以 `ID`/`Id` 结尾且非主键、无 `mapField` 字典（`xxxID`） | 映射名称 | `t-select` | 外键，走 `lookups` 兜底（§4.8） |
 | `Boolean` | ✓/✗ 标签 | `t-switch` | |
 | `DateTime` | `YYYY-MM-DD HH:mm` | `t-date-picker`(含时间) | 值式 `YYYY-MM-DD HH:mm:ss` |
 | `Int32/64/Double/...` | 数字 | `t-input-number` | **Int64 以字符串** |
@@ -544,6 +597,10 @@ const special = computed(() => SPECIAL_CONTROLLERS[`${area.value}/${controller.v
 - **实体接口双 `/api` 前缀 → Index/详情 404（高频坑）**：`http` 实例的 `baseURL` 已固定为 `/api`，所有经 `getApi/postApi/putApi/deleteApi`（即走 `http`）的实体调用**路径里不要再写 `/api`**。一旦写成 `/api/${area}/${controller}`，axios 拼出 `/api/api/${area}/${controller}`，后端无此路由 → **404**。典型表现：**`GetPage` 能通（200）但 `Index`/详情 404**——因列表接口多了一层前缀。正确做法：`useEntityResource` 的 `base` 用 `/${area}/${controller}`（无前缀）；`DetailDrawer`/`FormDialog` 的 `base` 同理不带 `/api`；`useLookups` 拉外键字典写 `/${a}/${ctrl}`。`assets/useEntityResource.ts`、`assets/useLookups.ts`、`assets/DetailDrawer.vue`、`assets/FormDialog.vue` 已按此修正。**落地后务必全量 `grep` `src` 中 `getApi(`/`postApi(`/`putApi(`/`deleteApi(` 的调用，确认无残留 `/api/` 硬编码**（登录/菜单走 `rawHttp` 带 `/api` 是正确用法，勿误删）。
 - **编辑保存/删除 405 = 把主键放进了 URL path（高频坑，实测 405 Method Not Allowed）**：NewLife.Cube 官方契约（NewLife.CubeVue 前端 + ObjectController 源码证实）是 **修改 `PUT /{Area}/{Controller}`（主键在 body，不在 URL）**、**删除 `DELETE /{Area}/{Controller}?id=xxx`（id 在 query，不在 URL path）**——`add: post(url) / update: put(url, data) / remove: delete(url, params:{id})` 全部打**主路由**。若前端写成 `PUT /{base}/{id}`、`DELETE /{base}/{id}`（id 在 URL path），后端无此路由 → **405 Method Not Allowed**（AxiosError status 405，栈落在 `putApi`/`deleteApi`）。**正确做法**：`useEntityResource.update(id, row)` 发 `putApi(base, body)`（body 合并主键兜底：`if (body.id==null && body.Id==null) body.id = id`）；`remove(id)` 发 `deleteApi(\`${base}?id=${encodeURIComponent(String(id))}\`)`。`assets/useEntityResource.ts` 已按此修正。**注意**：这是「第三代 WebApi 主路由风格」；老版 EntityController（Insert/Update/Delete Action 命名）另当别论，落地前 curl 探后端 swagger 确认。
 - **加载失败要显式暴露，勿静默空白**：`useEntityResource.loadSchema/loadData` 必须 `try/catch` 并把错误写入 `error` ref，列表页顶部用 `t-alert` 红色错误条展示「`/api/{area}/{controller}` + 失败原因」。否则「真实后端 `GetPage` 返回扁平 `fields` 而非五段数组」或「`schema.list` 为 `undefined` 致 `buildColumns` 抛错」时，页面会**静默空白**，用户只看到“右侧没数据”而无法定位。兼容策略见 §4.15 与 `assets/useEntityResource.ts` 的 `normalizeSchema`/`extractListPayload`（覆盖「五段数组」「扁平 fields + 视图标志位」「兜底空 schema」「`data` 直接数组/`{rows,page}`/`{list,page}`/`{page.rows}` 多种包裹」）。
+
+- **⚠️ `mapField` 双语义：`[Map]` 枚举字典源在 `mapField`，不在 `field.map`（Cube 通用列表页历史坑，2026-09 复现并修复）**：6.13 的 `DataField` **没有 `map` 字段**，`FieldItem.Map` 的 `k=v` 串被原样序列化进 `mapField`。枚举字段（如 `PersonType`/`ValueMode`/`Gender`/`WeComStatus`）若代码去读 `field.map`（不存在）→ 列表渲染成**原始 Int32**（`1`/`2`/`3`）、表单变纯 `t-input`。正确做法：用 `mapFieldKind`/`mapDictOf` 解析 `mapField` 字典串——列表 `labelOf` 显名、表单 `controlOf` 出 `t-select`（`options` 来自 `parseMapSource`）。**判别法**：`mapField` 能在字段集命中同名字段 → 映射字段（`field`，提交键用 `mapField`）；否则 → 字典源（`dict`，提交键用 `f.name`）。后端 `[Map("0=未知,1=男,2=女")]` 需加在**生成实体**上（`FieldItem.Map` 只读，手写实体加 `[Map]` 特性）。详见 §4.8.1。
+- **⚠️ TDesign `<t-select>` 渲染为 `<div class="t-select">`，不是原生 `<select>`（验收高频误判）**：判定"下拉是否渲染"**切勿** `querySelector('select')`（恒为 0），应查 `.t-select` 类或 `:placeholder` 是否 `请选择{label}`；表单项选择器是 `.t-dialog .t-form__item`（`t-form-item__{name}` 是派生 class，非 `.t-form-item`）。浏览器内 `fetch('/{area}/{ctrl}/GetPage')` 转储 `addForm` 可确认 `mapField` 在响应中完好（camelize 对 `mapField` 幂等、不剥离）。
+- **⚠️ `GetPage` 五段式契约（`list`/`addForm`/`editForm`/`detail`/`search`）**：各段**已按场景裁剪**——`addForm` 不含主键/只读/审计字段、`detail` 由后端剔除主键与审计、`search` 段给出的就是**后端真实查询参数名**（如 `Student` 的 `ClassID`，而 list 只暴露虚拟列 `ClassName`），正好替代手工 `searchParamMap`；表单新增走 `addForm`、编辑走 `editForm`。`useEntityResource.loadSchema` 将五段存入 `schema`，`ListPage` 分别消费。`camelize` 响应拦截器对所有键首字母小写（PascalCase→camelCase，对已是小写的 `mapField`/`name` 幂等），前端提交时 `toPascal` 把 camel 载荷还原为后端期望的 PascalCase 字段名（映射字段还原为 `mapField` 真实列名）。
 
 - **详情/编辑必须「接口优先」取单条（数据一致性），列表 row 仅作即时展示/兜底**：**单条接口是 `GET /api/{area}/{ctrl}/Detail?id={id}`（id 在 query，不是 path）——curl 实测 200，返回信封 `data` 为实体对象**。此前误判「无单条接口」是因为只试了**路径形式** `/{id}`、`/Detail/{id}`、`/Get/{id}`（三者确实 404）。**为什么要接口优先**：列表行是进入页面那一刻的快照，可能已被他人修改，直接用它回填并保存会**覆盖他人改动**。**正确做法**（`getById` 候选链，首个成功即返回、404 继续下一个）：① `/Detail?id=`（主路径，对象）② `/Get?id=` ③ `?id=`（**列表接口+主键过滤**，返回数组取首行，兜底可靠）④ `/{id}`（REST 风格部署兼容）。组件侧：`DetailDrawer`/`FormDialog` 先用 `props.row` 即时渲染（不空白），随后 `await res.getById(id)` 用接口最新值**覆盖**；接口失败/返回空则保留 row 兜底。另：`onEdit/onDetail` 取主键必须用 `getRowKey(row)`（遍历行键、小写精确匹配 `id`，兼容 `id/ID/Id`），**勿写死 `row.id`**（NewLife 主键常大写 `ID`，小写取不到 → 传 undefined → 请求 `/.../undefined`）。`assets/ListPage.vue`、`assets/DetailDrawer.vue`、`assets/FormDialog.vue`、`assets/useEntityResource.ts`（含 `getRowKey`/`getById`）已落地。
 - **编辑表单下拉显示数字 ID 而非名称 = 值类型不匹配（高频坑）**：TDesign `t-select` 用**严格相等 `===`** 匹配 value。而 `useLookups` 建字典用 `dict[String(idv)] = name` → **`resolveOptions` 生成的 options.value 全是字符串**；接口/列表行返回的外键 ID 却常是**数字**（JSON number）→ 类型不同匹配失败 → 下拉显示不出 label、回退显示原始数字 ID。**修复（`FormDialog` 两处，缺一不可）**：① **回填时类型对齐**——在 `options` 中按「值相同」找命中项，用它的 value（保持原类型）写回 `formData`（多值字段逐项对齐）；② **提交时还原数字**——单选 select 字段若值是纯数字字符串则 `Number(v)`（后端 Int32/Int64 严格反序列化，字符串可能绑定失败；仅对 `it.control === 'select'` 生效，避免误转普通文本数字字段如 `Code="123"`）。多值外键走 `serializeMultiValue`（逗号串，String 字段）不受影响。`assets/FormDialog.vue` 已落地。
@@ -690,6 +747,10 @@ const special = computed(() => SPECIAL_CONTROLLERS[`${area.value}/${controller.v
   **注意**：dll 反射给出的是**程序内的 C# 属性名**（PascalCase），**不等于** HTTP 上的 JSON 键名——本项目实测 C# 是 `AccessToken`，实际 HTTP 却是 `access_token`。故 dll 反射用于确定**枚举值、字段有无、请求模型结构**（高可信），而**响应 JSON 键名必须抓真实 HTTP 响应确认**（见上一条 stale/normToken 陷阱）。两者互补，不可互替。
 
 - **登录相关页调用 `auth` store helper，勿在组件内动态 `import('@/api/api')`（高频坑：构建告警 + 循环依赖）**：`ForgotPasswordView`/`RegisterView` 需 `resetPassword`/`registerUser` 时，应直接调用已注入的 `auth` store 方法，而非在组件内 `import('@/api/api')` 动态引入——后者触发 Vite 动态导入告警且易与 api 实例形成循环依赖。`assets/auth.ts` 已导出 `resetPassword`/`registerUser`/`sendCode`/`verifyMfa`，登录三页统一经 store 调用。
+
+- **`Message.success/error` 报 `is not a function`（高频坑，会导致"登录成功不跳首页"）**：TDesign Vue Next 中 `Message` 是**组件**，`MessagePlugin` 才是**函数式调用对象**。`import { Message } from 'tdesign-vue-next'` 后调 `Message.success(...)` 会抛 `TypeError: Message.success is not a function`；若该调用处在 `try` 内、其后还有 `router.replace(...)` 等跳转逻辑，异常会中断 `onSubmit`，表现为"后端已返回登录成功、token 已写入 localStorage，但页面不跳首页、必须刷新才进"——刷新后应用重启读到 localStorage 的 token 直接进首页，极具迷惑性。**统一写法**：`import { MessagePlugin } from 'tdesign-vue-next'` 并 `MessagePlugin.success/error/warning/info(...)`。`app.use(TDesign)` 全量引入已自动注册 `MessagePlugin`，无需额外 `app.use`。本项目 `LoginView/SyncCenter/ListPage/FormDialog` 已全部修正为 `MessagePlugin`。
+
+- **前端必须完整覆盖 NewLife.Cube 框架自带系统管理模块（避免"前端只做业务页、漏掉框架自带后台"）**：Cube 6.x 经 `AddCube()` 自动注册一组标准后台模块（Area=`/Admin` 与 `/Cube`），后端已就绪但前端常漏接。经实测可达的实体模块共 **9 个**（均为 `EntityController<T>`、返回完整 GetPage 五段式、可直接复用通用 `EntityPage` 零新增代码）：`/Admin/User`(用户)、`/Admin/Role`(角色)、`/Admin/Menu`(菜单)、`/Admin/Department`(部门)、`/Admin/Parameter`(参数/字典)、`/Admin/Log`(审计日志)、`/Admin/OAuthConfig`(OAuth 配置)、`/Admin/Tenant`(租户)、`/Cube/App`(应用)。Cube 6.x 已精简：**日志统一为 `Log`、字典/配置统一为 `Parameter`**，`Dic`/`Config`/`UserLog`/`VisitLog`/`TaskLog`/`RoleMenu`/`ModelNote`/`File`/`Stat`/`Index` 等返回 404（无需接入）。**接入方式**：只在 `BasicLayout` 菜单加"系统管理"组挂这 9 个链接（Area 大小写敏感：`/entity/Admin/User` 非 `/entity/admin/User`），通用 `EntityPage`（`/entity/:area/:controller`，props:true）直接消费 GetPage。**登录后首页应是系统仪表盘**（统计概览：并发 `GET /{area}/{controller}?pageSize=1` 取 `env.page.totalCount`），而非停在业务页。**Swagger 路径**：NewLife.Cube 的 Swagger UI 默认 `/Swagger`，但若后端 `Program.cs` 仅 `AddCube()` 未显式 `UseSwagger()`/`UseSwaggerUI()`，则 `/Swagger` 返回 404——需后端补 `app.UseSwagger(); app.UseSwaggerUI(c=>c.RoutePrefix="Swagger")` 并重启才可达；"通用挂载"可用接口探测等价确认，不依赖 Swagger。
 
 ## 八、推荐检查项
 
@@ -846,3 +907,53 @@ npm run build   # 产物在 dist/，交 Nginx / Cube 静态托管 / CDN
 2. **`ControllerBaseX` 派生的自定义控制器**（如 `DbController` 数据库管理）：暴露一组自定义端点（列表数组 / 文件下载 / 动作），既非单对象也非标准 CRUD 列表。按 §4.18 单列处理（专属页，如 `DbView` 列表+备份+下载架构）。
 
 **统一机制**：`EntityPage.vue` 用 `SPECIAL_CONTROLLERS` 注册表按 `area/controller`（区域作用域键）分发（`Admin/Cube` 等→`ConfigView`，`Admin/Db`→`DbView`），命中即渲染专属组件、否则走标准 `ListPage`；新增非实体控制器只在 `src/specialControllers.ts` 追加一条映射即可，无需新增路由。注册表必须显式策划（命名不可靠，见 §4.18）。或让后端也暴露 `GetPage` 形式的字段元数据以复用基类。
+
+## 十一、新工程初始化与内置模块页面模板复用（tdesign-starter-cli）
+
+**默认规则**：凡新建「魔方 WebApi + TDesign 前端」项目，前端骨架**一律用 tdesign-starter-cli** 初始化，再把本技能 `assets/` 模板与魔方内置模块页面（§11.3）拷入，禁止从零手搭。
+
+### 11.1 标准初始化（实测命令，Node ≥ 16）
+```bash
+npm i tdesign-starter-cli@latest -g
+td-starter init <项目名> -type vue3 -bt vite -temp lite   # Vue3 + Vite 精简模板
+cd <项目名> && npm install && npm run dev
+```
+选项：`-type` vue2|vue3|react|miniProgram|mobileVue（默认 vue2，**必须显式 `-type vue3`**）；`-bt` vite|webpack；`-temp` lite|all。
+
+### 11.2 拷入技能模板（assets/ → 目标路径映射）
+| assets/ 模板 | 目标路径 | 作用 |
+|---|---|---|
+| `fieldRender.ts` | `src/api/` | 元数据驱动渲染（mapField 双语义判别，§4.8.1） |
+| `useEntityResource.ts` | `src/api/` | 实体 CRUD 资源（base 必须 computed，防控制器切换不刷新） |
+| `useLookups.ts` / `useLov.ts` | `src/api/` | 外键/枚举值集字典 |
+| `http.ts`（+ `camel.ts` 放 `src/utils/`） | `src/api/` | 请求封装（双令牌头、camelize 响应、信封解包） |
+| `auth.ts` | `src/stores/` | 登录态/令牌 |
+| `ListPage.vue` / `FormDialog.vue` / `DetailDrawer.vue` | `src/components/cube/` | 通用列表/表单/详情基类组件 |
+| `EntityPage.vue` | `src/pages/` | 路由参数驱动的通用实体页 |
+| `DashboardView.vue` | `src/pages/` | 系统仪表盘首页（统计卡 + 近期日志，§11.3） |
+| `BasicLayout.vue` | `src/layouts/` | 侧边导航（含「系统管理」组） |
+
+> 拷贝后按项目 tsconfig/别名（`@/`）核对 import；`Message` 必须用 **`MessagePlugin`**（§七陷阱）；组件对 api 的引用用 `../../api/...`（§九导入路径约定）。
+
+### 11.3 魔方框架内置功能页面（NewLife.Cube 自带 9 模块）
+后端 `AddCube()` 即内置标准后台，前端**必须完整接入**（通用 EntityPage 零新增页面代码，路由 `/entity/:area/:controller`）：
+
+| 模块 | 路由 | 模块 | 路由 |
+|---|---|---|---|
+| 用户 | `/Admin/User` | 审计日志 | `/Admin/Log` |
+| 角色 | `/Admin/Role` | OAuth 配置 | `/Admin/OAuthConfig` |
+| 菜单 | `/Admin/Menu` | 租户 | `/Admin/Tenant` |
+| 部门 | `/Admin/Department` | 应用 | `/Cube/App` |
+| 参数/字典 | `/Admin/Parameter` | | |
+
+- Cube 6.x 已精简：`Dic`/`Config`/`UserLog`/`VisitLog`/`TaskLog`/`RoleMenu`/`File`/`Stat` 等 404，勿接入（日志统一 `Log`、字典/配置统一 `Parameter`）。
+- 导航加「概览（仪表盘）+ 系统管理（9 模块）」组，见 `assets/BasicLayout.vue`；`DashboardView.vue` 统计卡用并发 `GET /{area}/{ctrl}?pageSize=1` 取 `env.page.totalCount`。
+- **vite 代理**：真实魔方后端实体 API 在根路径 `/{Area}/{Controller}`（无 `/api` 前缀），dev 必须代理 `/Admin`、`/cube` 与业务 Area（hash 路由不受影响）；`references/scaffold` 的 mock 场景（/api 前缀）例外。
+- 后端启用 Swagger 供核对自带接口（**仅开发环境**）：服务注册与中间件都要包 `if (IsDevelopment())`，`AddEndpointsApiExplorer()` + `AddSwaggerGen()` + `UseSwagger()` + `UseSwaggerUI(c => c.RoutePrefix = "Swagger")`，需 `dotnet add package Swashbuckle.AspNetCore` + `using Microsoft.Extensions.Hosting;`；开发期 `ASPNETCORE_ENVIRONMENT=Development dotnet run` 后访问 `http://<host>:<port>/Swagger`。完整细节见 `cube-webapi-backend` skill §1.1。
+
+### 11.4 初始化完成验收清单
+1. `vue-tsc --noEmit` 0 错误（编译清零铁律）；
+2. 登录 → 跳转 `/dashboard` 仪表盘（不停在登录页/业务页；检查 `MessagePlugin` 误用，§七）；
+3. 系统管理 9 模块列表/新增可开，枚举列显名非 Int32（mapField 消费）；
+4. 表单枚举字段为 `t-select` 下拉（注意：TDesign `t-select` 渲染为 `<div>`，验收勿用 `querySelector('select')` 计数，转储 innerHTML 判定）；
+5. CDP 直驱 Chrome 截图闭环（登录跳转 + 仪表盘统计 + 各模块列表行数/列数）。
