@@ -73,6 +73,38 @@ app.Run();
 ```
 
 > 需要 `using NewLife.Cube;`（AddCube/UseCube 扩展）、`using NewLife.Log;`（ITracer/ILog/DefaultTracer/XTrace）。
+> 若启用 Swagger 还需 `using Microsoft.Extensions.Hosting;`（`IsDevelopment()` 扩展方法所在，缺失报 CS1061）。
+
+### 1.1 Swagger（仅开发环境启用，实测结论）
+
+Swagger UI 默认挂 `/Swagger`（NewLife.Cube 生态约定路径），用于**核对框架自带接口与数据格式**（实体 CRUD、Auth、GetFields/GetPage 等）。**只在开发环境启用**——生产环境不注册服务也不挂中间件，避免接口清单/模型结构对外暴露：
+
+```csharp
+// —— 服务注册（builder.Build() 之前）——
+if (builder.Environment.IsDevelopment())
+{
+    builder.Services.AddEndpointsApiExplorer();
+    builder.Services.AddSwaggerGen();
+}
+
+// —— 中间件（app.UseCube 之后）——
+if (app.Environment.IsDevelopment())
+{
+    app.UseSwagger();
+    app.UseSwaggerUI(c =>
+    {
+        c.RoutePrefix = "Swagger";   // UI 挂 /Swagger（Cube 生态约定路径，非默认 /swagger）
+        c.SwaggerEndpoint("/swagger/v1/swagger.json", "NewLife.Cube API v1");
+    });
+}
+```
+
+要点（全部实测踩过）：
+- **需安装包**：`dotnet add package Swashbuckle.AspNetCore`，否则 CS1061 三连（`AddSwaggerGen`/`UseSwagger`/`UseSwaggerUI` 均不存在）。
+- **服务与中间件两处都要包 `IsDevelopment()`**：只包中间件不包服务，生产仍注册了 Swagger 服务（徒增暴露面）；只包服务不包中间件则开发期 UI 不可达。
+- **环境判定**：`dotnet run` 无 `launchSettings.json` 或其未指定时默认 **Production**（实测启动日志 `Hosting environment: Production`）；开发期显式 `ASPNETCORE_ENVIRONMENT=Development dotnet run --urls http://127.0.0.1:5077`。
+- **实测行为**：Production 下 `/Swagger` → 404 且业务接口（如 `POST /Auth/Login`）正常 200；Development 下 `/Swagger` → 301 → `/Swagger/index.html` 200，`/swagger/v1/swagger.json` 200（含全部实体 CRUD 路径）。
+- **构建期文件锁**：旧进程未杀时 `dotnet build` 报 MSB3027/3021「文件被 WeComAddressBook.WebApi 锁定」——先 `taskkill /F /IM dotnet.exe` 再构建（代码本身 0 错误，勿误判为代码问题）。
 
 `appsettings.json` 必需连接字符串（`Membership` 存储用户/角色/菜单/权限）。**纯 WebApi 不配 `Cube:Theme`**——`Theme`（Tabler/Metronic/AdminLTE）是 MVC 服务器渲染前端的开关，WebApi 后端用不到；配了也不会生效，反而误导成"MVC 项目"：
 
@@ -667,25 +699,11 @@ GET /api/School/Student/ExportFile?format=xml
 - **⚠️ 新增控制器后 `Menu.Permission` 权限项回填失败 / 菜单行丢失（SQLite 启动并发写锁）**：Cube 启动异步初始化多线程并发写 `Membership.db`，SQLite 默认 busy timeout 常不够 → 日志 `code=Busy(5) database is locked`，`Menu.Save()` 的 INSERT/UPDATE **静默异常**。表现=新菜单行缺失或其 `Permission` 列为空，访问接口报 `{code:403,"...需要 查看 权限"}`（`设计错误！验证权限时无法找到[XxxController/Index]的菜单`）。修复：① 连接串加 `Busy Timeout=15000`（appsettings 各 sqlite 连接串，如 `DataSource=..\Data\Membership.db;Provider=sqlite;Busy Timeout=15000`）治本；② 已发生的补数据：手工 `INSERT Menu 行(Name,DisplayName,FullName,ParentID,Url,Permission='1#查看,2#添加,...')` + 把新菜单 ID 补进 `Role.Permission` 串（格式 `{menuId#位掩码}` 逗号分隔，`-1`=该菜单全部子权限，`19#1` 为系统管理特例）。生产首次部署建议串行初始化或预置 admin 全权。
 - **⚠️ `ConfigController<T>.Update` 走 XCode `Copy(obj, ignoreNull=false)`，部分字段 PUT 会把缺省字符串属性清空为 null（数据丢失事故）**：反编译确认 `ConfigController.Value` setter = `current.Copy(value,false)`——第二参 false 即"不忽略 null"，前端只回传部分字段（或 JSON 里字段值为 null）时，未携带/为 null 的 String 列被直接写空，既有配置被毁（实测：冒烟部分 PUT 后 `schoolDomain`/`operatorName` 全变 null，下游渲染器 `Quote(null)` 抛 NullReference → Preview 接口 500）。三层防御：① 渲染/消费侧对 null 容忍（`Quote(String? v){ v ??= "" }` 而非表达式体直接 `v.Replace`）；② 控制器重写 `protected override T Value` 的 setter，把 String 类型 null 回落为类型默认值（`new T()` 的属性值）再 `base.Value=value`；③ 或重写 `[HttpGet] Index()` 读时自愈+Save。**根治**：前端配置表单必须"整对象回传"（GET 全量→改→PUT 全量），不能只 PUT 改动字段。
 - **⚠️ 实体列名撞上 SQL 保留字（`Order`/`Group`/`User`/`Key`/`Desc` 等）会让 XCode 生成的 `ORDER BY col` 语法报错**：XCode 的 `FindAll(where, "ParentId ASC, Order ASC", ...)` 里 order 串**原样拼接**进 SQL，SQLite 报 `near "Order": syntax error`。修复：① order 串里给保留字列名加**双引号** `"\"Order\" ASC"`（SQLite 标识符引用符是双引号；MySQL 是反引号，故跨库项目应改列名）；② 更稳妥是 Model.xml 里就把该列命名为非保留字（`Sort` 优于 `Order`），改列名需 `xcode NvX.xml` 重新生成实体 + 迁移既有 DB 列。本项目 WecomDepartment.Order 走双引号转义（开发期 SQLite），若上生产 MySQL 需改列名。
+- **⚠️ `EntityController` 的 Insert/Update 按整实体绑定，部分字段 PUT 会把未传字段重置为默认值（账号被禁用事故）**：实测 `PUT /api/Admin/User` 只传 `{id,name,displayName,sex,mail,mobile,remark}`，响应里 `enable:false, online:false` —— 布尔字段被置 false，**admin 账号当场被禁用**，后续登录报 `账号admin被禁用！`（用户只能靠改库 `UPDATE User SET Enable=1` 救回）。同时 `RoleID`/`DepartmentID` 为空还会报 `保存失败！角色不可以为空！`。**根因**：模型绑定后未携带字段取 CLR 默认值，落库即覆盖。**正确做法（前端）**：个人资料类表单先 `GET Detail` 拿全量，以全量对象为基底浅合并可编辑字段后再 `PUT`（`{...detail, displayName, sex, ...}`，并**剔除 `password`** 避免哈希被当新密码）；**后端**若需局部更新，应显式重写 Update 或用 `Copy(model, ignoreNull:true)` 语义，别指望"不传即不改"。
+- **⚠️ 不要自定义 `UploadFile` 动作**：`EntityController<T>` 基类已内置附件上传（`POST /api/{area}/{ctrl}/UploadFile`，form-data 字段 `file`，返回 `{attId, filePath, contentType}`），子类再写同名动作会冲突。图片/头像/封面上传一律复用基类，见 14.3。
 
-## 推荐检查项
-
-- [ ] `Program.cs` 已 `AddControllers()` + `AddCube()`，且 `ITracer`/`ILog` 注册在 `AddCube()` **之后**（防被 AddCube 内部 null 工厂覆盖）
-- [ ] 纯自定义匿名控制器（回调/门户/开放 API）的 `[AllowAnonymous]` 标在**每个 Action 方法**上（类上标注对第 0 层鉴权无效）
-- [ ] 实体控制器标注了区域特性（如 `[SchoolArea]`）、`[DisplayName]`、`[Menu]`
-- [ ] 已按业务选对基类：标准 CRUD 用 `EntityController`；只读/字典/报表用 `ReadOnlyEntityController`；树形实体（WebApi）用 `EntityTreeApiController`（非 `EntityTreeController`）；纯自定义接口用 `ControllerBaseX`。需要字段级校验的已 `override EnableFieldValidation => true`
-- [ ] 字段定制写在 `static XxxController(){}` 而非实例构造器
-- [ ] 自定义 Action 已标注 `[EntityAuthorize]` 或 `[AllowAnonymous]`
-- [ ] 需要非 CRUD 的业务权限时，已用更高权限位 `(PermissionFlags)16/32` + `[DisplayName]` 标注，且角色管理能正确显示该权限项
-- [ ] 控制器已通过 `[Menu]` 声明可见性 `Mode`（`Admin`/`Tenant`/组合），避免租户/后台越权可见
-- [ ] 前端调用 `GetFields`/`GetPage` 驱动动态界面，未硬编码字段
-- [ ] 生产环境 `CubeSetting.JwtSecret` 为强密钥；`CorsOrigins` 已限制
-- [ ] 多租户场景已正确配置 `DataPermission` 表达式与 `EnableTenant`
-- [ ] 需要行级数据范围时，实体已实现 `IDataScope`/`IUserScope`/`IDepartmentScope` 并注册 `DataScopeInterceptor`（或在 `Search` 中 `ApplyScope`），角色 `DataScope` 已按“本人/本部门/本部门及下级/自定义/全部”配置，并注意多角色取最宽范围
-- [ ] 敏感字段已用 `IFieldScope` + `MaskSensitiveFields` 处理脱敏
-- [ ] 纯 WebApi 服务**未引用** `NewLife.Cube.AdminLTE` / 任何主题包（Razor 前端是 MVC 版，与 WebApi 不兼容）；`Program.cs` 仅 `AddCube()` + `UseCube()`
-
----
+- **⚠️ XCode SQLite 连接串 `:memory:` 覆盖致命 bug（所有接口 500 / `no such table`）**：XCode 的 SQLite DAL 会对**用户自定义连接串**追加 `Data Source=:memory:`。若你的连接串写成 `DataSource=Data\X.db;Provider=sqlite`（**无空格**），XCode 把 `DataSource`（无空格）与 `Data Source`（有空格）解析为**同一键**，后者 `:memory:` 覆盖你的文件路径 → 实际连的是**内存库**。后果：建表在一个连接、建索引/查询在另一连接 → `no such table: UserOnline/Parameter/...`，**所有接口 500**。修复（三处必须同时满足）：① 连接串键名写**带空格**的 `Data Source=`（不要 `DataSource=`）；② 删掉 `Provider=sqlite`（XCode 按扩展名自动识别 SQLite，留着反而干扰）；③ 追加 `Busy Timeout=15000` 防启动并发写锁。正确写法：`"MyBlog": "Data Source=Data\\MyBlog.db;Busy Timeout=15000"`（路径相对进程 CWD，见下方 CWD 陷阱）。**不要手动加建表代码**——用户明确要求"建表是 XCode 内部处理的，只要后端能正常启动 XCode 就会自动建表"，改连接串格式即可，db 会在 `bin/Debug/net8.0/Data/*.db` 落盘。验证：启动日志无 `:memory:`、Portal 接口返回 `code:0`、`Data/*.db` 文件大小 > 0。
+- **⚠️ Swagger 必须用 `IsDevelopment()` 双重包裹（服务注册 + 中间件各一处）**：只包中间件，生产仍注册 Swagger 服务（接口清单/模型结构暴露面徒增）；只包服务不挂中间件，开发期 UI 不可达。漏 `using Microsoft.Extensions.Hosting;` 时 `IsDevelopment()` 报 CS1061；漏 `Swashbuckle.AspNetCore` 包时 `AddSwaggerGen/UseSwagger/UseSwaggerUI` 三连 CS1061。生产验证标准：`/Swagger` → **404** 且业务接口（`POST /Auth/Login`）正常 200；开发环境验证：`/Swagger` → 301 → `/Swagger/index.html` 200。详见 §1.1。
 
 ## 十三、端到端示例：IoTHub 设备 / 协议 API（选型 + 自定义权限 + 数据范围 + 多租户）
 
@@ -841,3 +859,174 @@ public class DeviceCommandController : ControllerBaseX   // 非实体 CRUD，用
 - 数据范围：实体接 `IDataScope` + `IDataScopeFieldProvider`（非默认字段名）+ 注册 `DataScopeInterceptor`；
 - 多租户：`EnableTenant` + `TenantID` 字段 + 菜单 `Admin|Tenant` 可见性；
 - 校验：需 `FieldErrors` 时子类 `override EnableFieldValidation => true`。
+## 十四、前端联调契约速查（WebApi + 独立 SPA 实测结论）
+
+> 本节是「前端该按什么契约对接本后端」的**实测速查**，弥补第八/九节偏后端、缺前端落地细节的空白。
+> 经验来自 NewLife.Cube WebApi v6.13 + XCode v12.1 + SQLite 个人博客项目（Vue3/TDesign）端到端联调。
+> ⚠️ **不要靠反编译 dll 确认契约**——后端 JSON 行为随版本漂移，HTTP 实测（curl 探针）比读源码更准、更快。
+> 📌 **归属说明**：本节只记录**后端契约事实**（登录/路由/响应大小写/门户格式）。**前端代码落地与工程坑**（camelize 实现、脚手架三件套、Vite 代理、npm registry、manualChunks、base 路径、DialogPlugin、SQLite 并发串行）**全部已迁入 `cube-webapi-tdesign` skill 第七节「常见陷阱」**，本后端 skill 不再重复代码，避免前后端知识错置。
+
+### 14.1 登录契约（实测，与文档有出入）
+
+| 项 | 实测结论 | 文档写法 | 注意 |
+|----|---------|---------|------|
+| 请求体 | `POST /Auth/Login`，`{"username","password","category":0}` | 同 | `category:0`=密码登录；明文密码，无 challenge |
+| 令牌键名 | `data.access_token`（**snake_case**） | `data.accessToken`（camelCase） | **文档写错**，前端须做三向归一：`accessToken`/`AccessToken`/`access_token` |
+| 刷新令牌 | `data.refresh_token`（snake_case） | `data.refreshToken` | 同上归一 |
+| 鉴权头 | **只认 `Authorization: Bearer <token>`** | 文档还列 X-Token/Cookie/Query | `Authentication` 头返回 401；实测 Bearer 最稳 |
+| 默认账号 | `admin` / `admin` | — | 首登用户自动升管理员（但 admin 仍可用） |
+| 登录配置 | `GET /Auth/LoginConfig`（**匿名**），`oAuth` 键为**大写 A** | `oauth` | 前端做 `oAuth`/`oauth` 双写归一 |
+
+### 14.2 响应 JSON 大小写（关键）
+
+- **响应体：PascalCase**（`Id`/`Title`/`CreateUserID`/`PublishTime`），**非** CamelCase。skill 第八节说"FastJson CamelCase"——**实测当前版本输出 PascalCase**，前端**必须**在响应拦截器里 `camelize`（首字母小写 + 缩写保留：ID→id、URL→url、ParentID→parentID）归一，否则字段对不上。
+- **请求体：大小写不敏感**。实测 PascalCase 与 camelCase body **都能绑定成功**（ASP.NET ModelBinder 不区分大小写）。为稳妥，前端**请求统一发 PascalCase** 原样字段（与后端实体属性名一致），别依赖 camelCase。
+- **Int64 字符串化**：大整数 id 走字符串，前端按 string 处理避免精度丢失。
+
+#### 14.2.1 PascalCase → camelCase 缩写映射表（camelize 必须保留的规则）
+
+后端输出首字母转小写后，**内部连续大写缩写必须整体降首字母、保留尾大写**，否则字段错位。固化规则：
+
+| 后端 PascalCase | 前端 camelCase | 说明 |
+|----------------|---------------|------|
+| `Id` | `id` | 最常见，几乎每个实体都有 |
+| `CreateUserID` | `createUserID` | ID 整体保留，仅首字母 c 小写 |
+| `UpdateUserID` | `updateUserID` | 同上 |
+| `ParentID` | `parentID` | |
+| `CategoryID` | `categoryID` | |
+| `ArticleID` | `articleID` | |
+| `RoleID` | `roleID` | |
+| `TenantID` | `tenantID` | |
+| `URL` | `url` | 全小写（无尾大写） |
+| `API` | `api` | |
+| `HTTP` | `http` | |
+| `IP` | `ip` | |
+| `CreateTime` | `createTime` | 普通词，全小写 |
+| `PublishTime` | `publishTime` | |
+| `AccessToken` | `accessToken` | 但响应里实际是 `access_token`（snake），见 14.1 |
+
+**camelize 实现要点**（递归处理对象/数组/基本类型）：
+- 键名转换：`str[0].toLowerCase()` + 其余字符，对**连续大写缩写**用一个正则整体处理：把 `ID`/`URL`/`API`/`HTTP`/`IP` 等已知缩写映射为 `id`/`url`/`api`/`http`/`ip`；对 `XxxID` 形态用「遇到大写字母且前一词是缩写则保留尾大写」的通用规则兜底。
+- 实测可用的最小实现：先整体首字母小写，再对 `{2,}` 个连续大写字母段做「除最后一位外全小写」处理（如 `USERID`→`userId` 兜底为 `userID` 形态），并显式维护缩写白名单 `ID/URL/API/HTTP/IP` 直接转全小写。
+- 请求时**反向**：前端用 camelCase 状态，发请求前把已知字段 `id`→`Id`、`createUserID`→`CreateUserID` 等转回 PascalCase；但因请求体大小写不敏感（14.2），也可**直接发 camelCase 让 ModelBinder 绑定**，实测可行——为绝对稳妥发 PascalCase。
+
+
+#### 14.2.2 前端脚手架三件套（camel.ts / token.ts / http.ts）
+
+> **已迁入 `cube-webapi-tdesign` skill 第七节「常见陷阱」**（前端工程实践聚合条目），含可直接拷贝的完整代码：camelize 递归归一（含 ID/URL/ParentID 缩写白名单）、JWT 存取与用户名解析、axios 实例 + Bearer 注入 + 响应 camelize + 401 跳登录拦截器。本后端 skill 不重复代码，避免前后端知识错置。后端契约层面只需记住：响应 PascalCase、请求体大小写不敏感、令牌键 `access_token`（snake_case 三向归一）。
+
+### 14.3 标准 CRUD 路由（EntityController<T>）
+
+| 操作 | 路由 | 注意 |
+|------|------|------|
+| 列表 | `GET /api/{area}/{ctrl}?pageIndex=1&pageSize=10` | 返回 `{code:0,data:[...],page:{totalCount,...}}`；**`data` 是数组、`page` 独立** |
+| 详情 | `GET /api/{area}/{ctrl}/Detail?id={id}` | **id 是查询参数**，不是路径 `/Detail/{id}`（路径写法返回空） |
+| 新增 | `POST /api/{area}/{ctrl}`，body=实体 | 成功 `code:0` |
+| 修改 | `PUT /api/{area}/{ctrl}`，body 带 `id` | 改必须带 id |
+| 删除 | `DELETE /api/{area}/{ctrl}?id={id}` | 单条 |
+| 自定义动作 | `POST /api/{area}/{ctrl}/{Action}?id=` | 如 `Publish`/`Offline`/`ToggleTop`，返回 `ApiResponse<String>`（Code=0/500） |
+
+**基类内置的额外动作（实测可用，勿重复造轮子）**：
+
+| 动作 | 路由 | 请求 | 实测返回 |
+|------|------|------|---------|
+| 附件上传 | `POST /api/{area}/{ctrl}/UploadFile` | `multipart/form-data`，字段名 `file` | `{"code":0,"data":{"attId":"7500438413327732736","filePath":"/cube/image?id=7500438413327732736.png","contentType":"image/png"}}` |
+| 修改密码 | `POST /api/{area}/User/ChangePassword` | `{id, oldPassword, newPassword, newPassword2}` | 成功 `code:0`；同旧密码报 `修改密码不能与原密码一致`；无权限 403/405 |
+
+- **`UploadFile` 是 `EntityController<T>` 自带动作**，子类若再定义同名 `UploadFile` 会与基类冲突 —— 需要上传能力**直接复用基类**，前端按上表调 `{area}/{ctrl}/UploadFile` 即可。
+- `filePath` 为**相对路径**（`/cube/image?id=xxx.png`），前端图片直接 `src=filePath`；Vite dev 需代理 `/cube` 到后端，否则 404。
+- WebApi 模式下**没有**这些 MVC 专属接口：`MyProfile`（500，MVC 动作不兼容）、`SysSetting`/`CubeSetting`/`UserCenter/*`（404）。"魔方设置 / 系统设置"类页面在纯 WebApi 模式下**无法前端可视化维护**，需自行补配置读写控制器，或引导用户在 MVC 后台维护。
+- **个人中心 / 基本设置 / 修改密码 的纯 WebApi 实现方案**：不要等 `MyProfile`/`UserCenter`（均不可用），**直接复用 Admin/User 的标准 CRUD**：① 按用户名调 `GET /api/Admin/User?key={name}` 定位当前用户，再 `GET /api/Admin/User/Detail?id={id}` 取完整资料；② 保存个人资料用 `PUT /api/Admin/User`（body 必须带回 `roleId`/`departmentId`/`enable`/`online` 等原值，否则魔方校验会失败或把账号改禁用）；③ 修改密码用 `POST /api/Admin/User/ChangePassword`（`{id, oldPassword, newPassword, newPassword2}`）。头像如需上传，同样走 `POST /api/Admin/User/UploadFile`，返回 `filePath` 后回填到 `avatar` 字段再 PUT 保存。
+
+### 14.4 匿名门户（PortalController 模式）
+
+博客/官网类项目常写 `PortalController : ControllerBaseX`（**不继承 EntityController**，规避鉴权），提供匿名读接口：
+- `Articles(categoryId,tagId,key,pageIndex,pageSize)` → 返回 `{items,totalCount,pageIndex,pageSize,pageCount}`（**`data` 是对象不是数组**，与 EntityController 列表格式不同，前端要分支处理）
+- `Detail?id=`、`Categories()`、`Tags()`、`About()`、`Archives()`
+- 门户接口**全部 `[AllowAnonymous]`**，但 `[AllowAnonymous]` 必须标在 **Action 方法**上（见 6.5 第 0 层鉴权只认方法级）。
+
+### 14.5 前端工程落地坑（跨端说明，详情见 tdesign skill）
+
+> 以下前端工程坑的**完整代码与做法均已迁入 `cube-webapi-tdesign` skill 第七节「常见陷阱」**（前端工程实践聚合条目）。本后端 skill 仅保留**跨端事实**与指向，不重复前端代码：
+> - Vite 代理 target 必须 `127.0.0.1` 而非 `localhost`（沙箱 502）→ 见 tdesign 第七节
+> - npm registry 卡死改用 `registry.npmmirror.com`（沙箱 21 分钟 0 输出）→ 见 tdesign 第七节
+> - TDesign 全量引入 chunk 过大 → `manualChunks` 拆 vendor → 见 tdesign 第七节
+> - 生产 base 路径 `/blog/` + Nginx 子路径反向代理 → 见 tdesign 第七节
+> - 删除确认用 `DialogPlugin.confirm` → 见 tdesign 第七节
+> - TDesign `<t-form>` 的 `@submit.prevent` 崩溃 → 见 tdesign 第七节（已详述）
+
+- **⚠️ SQLite 并发死锁（跨端事实，后端行为 + 前端修复）**：本后端 SQLite 在**同一页面 3+ 并发查询**时会死锁（busy timeout 不够），前端表现为列表永远 loading。这是后端 SQLite 并发限制，但**前端可规避**：串行发请求（先 `loadMeta()` await 完再 `loadArticles()`），不要 `Promise.all` 并发打同库多接口。治本可在后端连接串加 `Busy Timeout=15000`（见第十二节 `:memory:` 修复同源）。前端串行写法见 `cube-webapi-tdesign` 第七节。
+
+### 14.6 联调验证清单（冒烟）
+
+- [ ] `POST /Auth/Login` 返回 `data.access_token`（三向归一后取到）
+- [ ] 带 `Authorization: Bearer` 访问 `GET /api/{area}/{ctrl}` → 200 + `data:[]`
+- [ ] **不带 token** 访问同一接口 → 401（确认鉴权链路通）
+- [ ] 列表 `data` 为数组 + 独立 `page`；门户列表 `data` 为 `{items,...}`（分支处理）
+- [ ] 响应拦截器 `camelize` 后前端字段对齐（如 `createUserID`）
+- [ ] 自定义动作 `POST /{Action}?id=` 返回 `code:0`
+- [ ] 首页多接口**串行**加载，无永久 loading
+
+### 14.7 标准冒烟探针脚本（curl，登录→token→401/200 验证）
+
+> 复制到 bash 直接跑（Windows Git Bash / WSL 均可）。`BASE` 填后端地址；前端走代理时填前端地址（如 `http://127.0.0.1:5173`）亦可，代理会转发到后端。
+
+```bash
+BASE="http://127.0.0.1:5000"          # 或前端代理地址 http://127.0.0.1:5173
+USER="admin"; PASS="admin"
+
+echo "=== 1) 登录拿 token（实测键名 data.access_token，snake_case）==="
+RESP=$(curl -s -m 8 -X POST "$BASE/Auth/Login" \
+  -H "Content-Type: application/json" \
+  -d "{\"username\":\"$USER\",\"password\":\"$PASS\",\"category\":0}")
+echo "$RESP" | head -c 200; echo
+TOKEN=$(echo "$RESP" | sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p')
+echo "token_len=${#TOKEN}"
+[ -z "$TOKEN" ] && { echo "❌ 登录失败，未拿到 token"; exit 1; }
+
+echo "=== 2) 带 token 访问管理列表（应 200 + data）==="
+curl -s -m 8 -H "Authorization: Bearer $TOKEN" \
+  "$BASE/api/Blog/Article?pageSize=10" | head -c 200; echo
+
+echo "=== 3) 不带 token 访问（应 401，确认鉴权链路通）==="
+curl -s -m 8 -o /dev/null -w "no-token HTTP %{http_code}\n" \
+  "$BASE/api/Blog/Article?pageSize=10"
+
+echo "=== 4) 匿名门户（应 200 + code:0，无需 token）==="
+curl -s -m 8 "$BASE/api/Blog/Portal/Categories" | head -c 200; echo
+
+echo "=== 5) 详情 id 走查询参数（应返回数据，非空）==="
+curl -s -m 8 "$BASE/api/Blog/Portal/Detail?id=1" | head -c 200; echo
+```
+
+**判定标准**：
+- 步骤 1 `token_len > 0` → 登录契约正确（若拿到的是 `accessToken` 说明版本差异，改 sed 正则即可）
+- 步骤 2 返回 `code:0` + `data` 数组 → CRUD 列表通
+- 步骤 3 `HTTP 401` → `[AllowAnonymous]` 缺失的接口被正确拦截，鉴权生效
+- 步骤 4 `code:0` → 匿名门户通
+- 步骤 5 返回 `Content` 等字段 → `Detail?id=` 查询参数写法正确（若用 `/Detail/1` 路径则返回空，印证 14.3 结论）
+
+> Windows PowerShell 里 `sed` 不可用，改用：`($RESP | Select-String '"access_token":"([^"]*)"').Matches.Groups[1].Value` 取 token；或装 Git Bash。
+
+---
+
+## 推荐检查项
+
+- [ ] `Program.cs` 已 `AddControllers()` + `AddCube()`，且 `ITracer`/`ILog` 注册在 `AddCube()` **之后**（防被 AddCube 内部 null 工厂覆盖）
+- [ ] 纯自定义匿名控制器（回调/门户/开放 API）的 `[AllowAnonymous]` 标在**每个 Action 方法**上（类上标注对第 0 层鉴权无效）
+- [ ] 实体控制器标注了区域特性（如 `[SchoolArea]`）、`[DisplayName]`、`[Menu]`
+- [ ] 已按业务选对基类：标准 CRUD 用 `EntityController`；只读/字典/报表用 `ReadOnlyEntityController`；树形实体（WebApi）用 `EntityTreeApiController`（非 `EntityTreeController`）；纯自定义接口用 `ControllerBaseX`。需要字段级校验的已 `override EnableFieldValidation => true`
+- [ ] 字段定制写在 `static XxxController(){}` 而非实例构造器
+- [ ] 自定义 Action 已标注 `[EntityAuthorize]` 或 `[AllowAnonymous]`
+- [ ] 需要非 CRUD 的业务权限时，已用更高权限位 `(PermissionFlags)16/32` + `[DisplayName]` 标注，且角色管理能正确显示该权限项
+- [ ] 控制器已通过 `[Menu]` 声明可见性 `Mode`（`Admin`/`Tenant`/组合），避免租户/后台越权可见
+- [ ] 前端调用 `GetFields`/`GetPage` 驱动动态界面，未硬编码字段
+- [ ] 生产环境 `CubeSetting.JwtSecret` 为强密钥；`CorsOrigins` 已限制
+- [ ] 多租户场景已正确配置 `DataPermission` 表达式与 `EnableTenant`
+- [ ] 需要行级数据范围时，实体已实现 `IDataScope`/`IUserScope`/`IDepartmentScope` 并注册 `DataScopeInterceptor`（或在 `Search` 中 `ApplyScope`），角色 `DataScope` 已按“本人/本部门/本部门及下级/自定义/全部”配置，并注意多角色取最宽范围
+- [ ] 敏感字段已用 `IFieldScope` + `MaskSensitiveFields` 处理脱敏
+- [ ] 纯 WebApi 服务**未引用** `NewLife.Cube.AdminLTE` / 任何主题包（Razor 前端是 MVC 版，与 WebApi 不兼容）；`Program.cs` 仅 `AddCube()` + `UseCube()`
+- [ ] Swagger（若启用）已用 `IsDevelopment()` 双重包裹服务注册与中间件（§1.1），且已装 `Swashbuckle.AspNetCore` 包、`using Microsoft.Extensions.Hosting;`；生产环境实测 `/Swagger` 404、业务接口正常
+
+---
+
